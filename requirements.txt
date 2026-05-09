@@ -1,0 +1,26 @@
+# Beauty Bible Agent - Dependencies
+
+# Telegram Bot Framework
+python-telegram-bot>=20.0
+
+# Async HTTP client
+httpx>=0.25.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Image processing (for basic skin analysis fallback)
+Pillow>=10.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+
+# Google Gemini (optional, for free vision analysis)
+google-generativeai>=0.3.0
+
+# Optional: OpenAI (if not using OpenRouter)
+# openai>=1.0.0
+
+# Development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
