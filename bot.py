@@ -10,6 +10,7 @@ from html import escape as html_escape
 from pathlib import Path
 
 from telegram import Update
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from src.skin_analyzer import SkinAnalyzer
@@ -341,7 +342,21 @@ async def _post_shutdown(application):
 
 async def _on_error(update, context):
     """Catch-all so handler failures are logged + user gets a friendly reply."""
-    logger.exception("Unhandled error in handler", exc_info=context.error)
+    err = context.error
+
+    # Conflict = old container still polling during a deploy overlap.
+    # PTB retries the polling loop internally, self-heals in ~30s. Not actionable.
+    if isinstance(err, Conflict):
+        logger.warning(f"Telegram getUpdates conflict (deploy overlap): {err}")
+        return
+
+    # Transient network blips: PTB's retry loop handles them. Just note in logs.
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Transient network error: {type(err).__name__}: {err}")
+        return
+
+    # Anything else is genuinely unexpected — full stacktrace for diagnosis.
+    logger.exception("Unhandled error in handler", exc_info=err)
     try:
         if update and getattr(update, 'effective_message', None):
             await update.effective_message.reply_text(
@@ -379,7 +394,13 @@ def main():
     logger.info("🤖 BB (Beauty Bible) iniciando...")
     print("🤖 BB iniciada! Pressione Ctrl+C para parar")
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates: on startup, throw away updates that piled up during
+    # the previous container's shutdown — avoids reprocessing the same message
+    # twice when EasyPanel rolls the deploy.
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == '__main__':
