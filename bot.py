@@ -7,6 +7,8 @@ import os
 import logging
 from pathlib import Path
 
+from html import escape as html_escape
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -52,39 +54,39 @@ class BeautyBibleBot:
         await storage.record_consent(user.id)
 
         welcome_message = """
-✨ *Oi, eu sou a BB!* ✨
+✨ <b>Oi, eu sou a BB!</b> ✨
 
 Sua consultora pessoal de beleza. Posso te ajudar a:
 
-🔍 *Analisar sua pele* — Envie uma foto do seu rosto e eu identifico seu tom, tipo e necessidades
+🔍 <b>Analisar sua pele</b> — Envie uma foto do seu rosto e eu identifico seu tom, tipo e necessidades
 
-💄 *Recomendar produtos* — Com base na análise, sugiro o que combina com você
+💄 <b>Recomendar produtos</b> — Com base na análise, sugiro o que combina com você
 
-🧴 *Montar sua rotina* — Cuidado personalizado, manhã e noite
+🧴 <b>Montar sua rotina</b> — Cuidado personalizado, manhã e noite
 
-📦 *Tirar dúvidas* — Sobre ingredientes, marcas, técnicas
+📦 <b>Tirar dúvidas</b> — Sobre ingredientes, marcas, técnicas
 
 Como posso te ajudar hoje?
 
-_Seus dados são protegidos. Use /apagar\\_meus\\_dados a qualquer momento._
+<i>Seus dados são protegidos. Use /apagar_meus_dados a qualquer momento.</i>
 """
-        await update.message.reply_text(welcome_message, parse_mode='Markdown')
+        await update.message.reply_text(welcome_message, parse_mode='HTML')
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = """
-📚 *Comandos disponíveis:*
+📚 <b>Comandos disponíveis:</b>
 
 /start — Iniciar conversa
 /help — Ver esta ajuda
 /perfil — Ver minha análise de pele atual
-/apagar\\_meus\\_dados — Apagar tudo o que a BB sabe sobre você
+/apagar_meus_dados — Apagar tudo o que a BB sabe sobre você
 
-💡 *Dicas:*
+💡 <b>Dicas:</b>
 - Para análise de pele, mande uma foto com boa luz
 - Pode perguntar sobre ingredientes específicos
 - A BB lembra das nossas conversas anteriores
 """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        await update.message.reply_text(help_text, parse_mode='HTML')
 
     async def profile_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -94,15 +96,17 @@ _Seus dados são protegidos. Use /apagar\\_meus\\_dados a qualquer momento._
                 "Ainda não temos sua análise! Me envie uma foto pra começarmos 📸"
             )
             return
-        text = "✨ *Seu Perfil Atual* ✨\n\n"
-        text += f"🎨 *Tom:* {profile.get('skin_tone_name') or 'N/D'}\n"
-        text += f"💧 *Tipo:* {profile.get('skin_type') or 'N/D'}\n"
-        text += f"🔸 *Subtom:* {profile.get('undertone') or 'N/D'}\n"
+        text = "✨ <b>Seu Perfil Atual</b> ✨\n\n"
+        text += f"🎨 <b>Tom:</b> {html_escape(profile.get('skin_tone_name') or 'N/D')}\n"
+        text += f"💧 <b>Tipo:</b> {html_escape(profile.get('skin_type') or 'N/D')}\n"
+        text += f"🔸 <b>Subtom:</b> {html_escape(profile.get('undertone') or 'N/D')}\n"
         concerns = profile.get('concerns', [])
         if concerns:
-            text += "\n*Concerns:*\n" + "\n".join(f"  • {c}" for c in concerns)
-        text += f"\n\n_Atualizado em {profile.get('updated_at')}_"
-        await update.message.reply_text(text, parse_mode='Markdown')
+            text += "\n<b>Concerns:</b>\n" + "\n".join(
+                f"  • {html_escape(c)}" for c in concerns
+            )
+        text += f"\n\n<i>Atualizado em {html_escape(str(profile.get('updated_at')))}</i>"
+        await update.message.reply_text(text, parse_mode='HTML')
 
     async def delete_data_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """LGPD Art. 18 — right to be forgotten."""
@@ -110,9 +114,9 @@ _Seus dados são protegidos. Use /apagar\\_meus\\_dados a qualquer momento._
         counts = await storage.delete_user_data(user.id)
         total = sum(counts.values())
         await update.message.reply_text(
-            f"🗑️ *Pronto.* Apaguei tudo o que tínhamos sobre você ({total} registros).\n\n"
+            f"🗑️ <b>Pronto.</b> Apaguei tudo o que tínhamos sobre você ({total} registros).\n\n"
             f"Se quiser voltar, é só me mandar um /start. 💛",
-            parse_mode='Markdown',
+            parse_mode='HTML',
         )
         logger.info(f"LGPD delete executed for user {user.id}: {counts}")
 
@@ -165,7 +169,7 @@ _Seus dados são protegidos. Use /apagar\\_meus\\_dados a qualquer momento._
             )
 
             result_text = self._format_analysis_result(analysis, recommendations)
-            await processing_msg.edit_text(result_text, parse_mode='Markdown')
+            await processing_msg.edit_text(result_text, parse_mode='HTML')
 
         except Exception as e:
             logger.exception(f"Error analyzing photo: {e}")
@@ -197,28 +201,31 @@ _Seus dados são protegidos. Use /apagar\\_meus\\_dados a qualquer momento._
         response = await self.agent.get_response(user_message=redacted, user_id=user.id)
 
         await storage.append_message(user.id, 'assistant', response)
-        await update.message.reply_text(response, parse_mode='Markdown')
+        # No parse_mode: LLM responses are free-form and may contain unbalanced
+        # markdown that would crash the send. Plain text is safer.
+        await update.message.reply_text(response)
 
     # -----------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------
     def _format_analysis_result(self, analysis: dict, recommendations: list) -> str:
-        text = "✨ *Análise da Sua Pele* ✨\n\n"
-        text += f"🎨 *Tom de Pele:* {analysis.get('skin_tone', 'N/D')}\n"
-        text += f"💧 *Tipo de Pele:* {analysis.get('skin_type', 'N/D')}\n"
+        e = html_escape
+        text = "✨ <b>Análise da Sua Pele</b> ✨\n\n"
+        text += f"🎨 <b>Tom de Pele:</b> {e(str(analysis.get('skin_tone', 'N/D')))}\n"
+        text += f"💧 <b>Tipo de Pele:</b> {e(str(analysis.get('skin_type', 'N/D')))}\n"
         if analysis.get('undertone'):
-            text += f"🔸 *Subtom:* {analysis.get('undertone')}\n"
+            text += f"🔸 <b>Subtom:</b> {e(str(analysis.get('undertone')))}\n"
         if analysis.get('concerns'):
-            text += "\n*Concerns identificados:*\n"
+            text += "\n<b>Concerns identificados:</b>\n"
             for concern in analysis.get('concerns', []):
-                text += f"  • {concern}\n"
+                text += f"  • {e(str(concern))}\n"
 
         text += "\n" + "=" * 30 + "\n"
-        text += "💡 *Produtos Recomendados:*\n\n"
+        text += "💡 <b>Produtos Recomendados:</b>\n\n"
         for i, rec in enumerate(recommendations[:5], 1):
-            text += f"{i}. *{rec['name']}*\n"
+            text += f"{i}. <b>{e(rec['name'])}</b>\n"
             text += f"   💰 R$ {rec['price']}\n"
-            text += f"   📝 {rec['description'][:80]}...\n\n"
+            text += f"   📝 {e(rec['description'][:80])}...\n\n"
         text += "\n💬 Quer mais detalhes sobre algum produto?"
         return text
 
@@ -230,6 +237,18 @@ async def _post_init(application):
 
 async def _post_shutdown(application):
     stop_scheduler()
+
+
+async def _on_error(update, context):
+    """Catch-all so handler failures are logged + user gets a friendly reply."""
+    logger.exception("Unhandled error in handler", exc_info=context.error)
+    try:
+        if update and getattr(update, 'effective_message', None):
+            await update.effective_message.reply_text(
+                "Ops, tive um probleminha aqui. Pode tentar de novo? 💛"
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
 
 
 def main():
@@ -255,6 +274,7 @@ def main():
     application.add_handler(CommandHandler("apagar_meus_dados", bot.delete_data_command))
     application.add_handler(MessageHandler(filters.PHOTO, bot.handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    application.add_error_handler(_on_error)
 
     logger.info("🤖 BB (Beauty Bible) iniciando...")
     print("🤖 BB iniciada! Pressione Ctrl+C para parar")
