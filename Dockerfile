@@ -1,10 +1,8 @@
 FROM python:3.12-slim
 
-# OS deps for sqlcipher3-wheels + Pillow
+# Minimal OS deps. sqlcipher3-wheels, Pillow and sklearn ship statically-linked
+# binaries in their Python wheels — no system libs needed beyond TLS + init.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libsqlcipher0 \
-        libjpeg62-turbo \
-        zlib1g \
         ca-certificates \
         tini \
     && rm -rf /var/lib/apt/lists/*
