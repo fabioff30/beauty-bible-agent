@@ -1,5 +1,8 @@
 """
-Beauty Advisor Agent - AI conversational agent for beauty recommendations
+Beauty Advisor Agent (BB) - AI conversational agent for beauty recommendations.
+
+User-facing persona: BB.
+Internal codename: beauty_bible.
 """
 
 import json
@@ -8,34 +11,32 @@ import os
 from typing import Dict, List, Optional
 from datetime import datetime
 
-import httpx
+from src.db import storage
+from src.llm import chat_completion
 
 logger = logging.getLogger(__name__)
 
 
 class BeautyAdvisorAgent:
-    """AI agent that provides personalized beauty advice and product recommendations"""
+    """BB — AI agent that provides personalized beauty advice and product recommendations."""
 
     def __init__(self, product_db, skin_analyzer):
         """
         Initialize the beauty advisor
-        
+
         Args:
             product_db: ProductDatabase instance
             skin_analyzer: SkinAnalyzer instance
         """
         self.product_db = product_db
         self.skin_analyzer = skin_analyzer
-        
+
         # AI model configuration
         self.provider = os.getenv('AI_PROVIDER', 'openrouter')  # openrouter, openai, gemini
-        self.model = os.getenv('AI_MODEL', 'openai/gpt-4o-mini')
-        
-        # Conversation context
-        self.conversations = {}
-        
-        # System prompt for beauty advisor
-        self.system_prompt = """Você é a Nina, uma consultora de beleza especializada da Beauty Bible.
+        self.model = os.getenv('AI_MODEL', 'google/gemini-2.5-flash')
+
+        # System prompt for BB
+        self.system_prompt = """Você é a BB, consultora de beleza pessoal da Beauty Bible.
 Sua especialidade é recomendar produtos de beleza baseados na análise de pele da cliente.
 
 Tons de voz:
@@ -57,155 +58,83 @@ IMPORTANTE:
 - Baseie suas recomendações nos dados de análise de pele quando disponíveis
 - Seja honesta sobre limitações dos produtos
 - Pergunte sobre orçamento e preferências antes de recomendar
+- Se a cliente pedir para esquecer/apagar seus dados, oriente-a a usar o comando /apagar_meus_dados
 
 Produtos disponíveis na linha Dani:
 {dani_products}
 """
 
-    def _get_system_prompt(self, skin_analysis: Optional[Dict] = None) -> str:
-        """Build system prompt with context"""
+    def _get_system_prompt(
+        self,
+        skin_analysis: Optional[Dict] = None,
+        rolling_summary: Optional[str] = None,
+        facts: Optional[List[Dict]] = None,
+    ) -> str:
+        """Build system prompt with persisted user context."""
         # Get product summary
         products = self.product_db._get_sample_products()
         product_summary = ""
         for p in products[:5]:
             product_summary += f"- {p['name']}: R${p['price']} - {p['description'][:80]}...\n"
-        
+
         prompt = self.system_prompt.format(dani_products=product_summary.strip())
-        
+
         if skin_analysis:
             prompt += f"""
 
 DADOS DA ANÁLISE DE PELE DA CLIENTE:
-- Tom de pele: {skin_analysis.get('skin_tone', 'N/D')}
+- Tom de pele: {skin_analysis.get('skin_tone') or skin_analysis.get('skin_tone_name', 'N/D')}
 - Tipo de pele: {skin_analysis.get('skin_type', 'N/D')}
 - Subtom: {skin_analysis.get('undertone', 'N/D')}
 - Concerns: {', '.join(skin_analysis.get('concerns', [])) or 'Nenhum identificado'}
 - Confiança da análise: {skin_analysis.get('confidence', 'N/D')}
 
 Use estes dados para personalizar suas recomendações."""
-        
-        prompt += f"""
-Data atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}
-"""
+
+        if facts:
+            prompt += "\n\nFATOS PERSISTENTES SOBRE A CLIENTE (use, mas não recite literalmente):\n"
+            for f in facts[:15]:
+                prompt += f"- {f['key']}: {f['value']}\n"
+
+        if rolling_summary:
+            prompt += f"\n\nRESUMO DAS CONVERSAS ANTERIORES:\n{rolling_summary}\n"
+
+        prompt += f"\nData atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         return prompt
 
-    async def get_response(
-        self,
-        user_message: str,
-        user_id: int,
-        skin_analysis: Optional[Dict] = None
-    ) -> str:
+    async def get_response(self, user_message: str, user_id: int) -> str:
         """
-        Generate AI response to user message
-        
+        Generate AI response, reading context from the persistent store.
+
         Args:
-            user_message: User's text message
+            user_message: User's text message (already PII-redacted upstream)
             user_id: Telegram user ID
-            skin_analysis: Previous skin analysis results
-            
+
         Returns:
             AI response text
         """
-        # Track conversation
-        if user_id not in self.conversations:
-            self.conversations[user_id] = []
-        
-        self.conversations[user_id].append({
-            'role': 'user',
-            'content': user_message,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        # Keep only last 10 messages
-        if len(self.conversations[user_id]) > 20:
-            self.conversations[user_id] = self.conversations[user_id][-20:]
-        
-        # Build messages for API
-        system_prompt = self._get_system_prompt(skin_analysis)
-        
-        messages = [
-            {"role": "system", "content": system_prompt}
-        ]
-        
-        # Add conversation history
-        for msg in self.conversations[user_id][-10:]:
-            messages.append({"role": msg['role'], "content": msg['content']})
-        
+        # Load persisted context
+        profile = await storage.get_profile(user_id)
+        facts = await storage.list_facts(user_id)
+        summary_row = await storage.get_summary(user_id, scope='rolling')
+        history = await storage.recent_messages(user_id, limit=10)
+
+        system_prompt = self._get_system_prompt(
+            skin_analysis=profile,
+            rolling_summary=summary_row['summary'] if summary_row else None,
+            facts=facts,
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history:
+            messages.append({"role": msg['role'], "content": msg['content_redacted']})
+        messages.append({"role": "user", "content": user_message})
+
         try:
-            response = await self._call_ai_api(messages)
-            
-            # Store response
-            self.conversations[user_id].append({
-                'role': 'assistant',
-                'content': response,
-                'timestamp': datetime.now().isoformat()
-            })
-            
-            return response
-            
+            return await chat_completion(messages, model=self.model)
         except Exception as e:
             logger.error(f"AI API error: {e}")
-            return self._get_fallback_response(user_message, skin_analysis)
-
-    async def _call_ai_api(self, messages: List[Dict]) -> str:
-        """Call AI API for response"""
-        
-        if self.provider == 'openrouter':
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY', '')}",
-                "HTTP-Referer": "https://beautybible.app",
-                "X-Title": "Beauty Bible",
-                "Content-Type": "application/json"
-            }
-        elif self.provider == 'openai':
-            api_url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
-                "Content-Type": "application/json"
-            }
-        elif self.provider == 'gemini':
-            return await self._call_gemini(messages)
-        else:
-            raise ValueError(f"Unknown provider: {self.provider}")
-        
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": 800,
-            "temperature": 0.7,
-            "top_p": 0.9
-        }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            return data['choices'][0]['message']['content']
-
-    async def _call_gemini(self, messages: List[Dict]) -> str:
-        """Call Google Gemini API"""
-        try:
-            import google.generativeai as genai
-            
-            genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            
-            # Convert messages to Gemini format
-            prompt = ""
-            for msg in messages:
-                if msg['role'] == 'system':
-                    prompt += f"INSTRUÇÕES: {msg['content']}\n\n"
-                elif msg['role'] == 'user':
-                    prompt += f"Usuária: {msg['content']}\n"
-                elif msg['role'] == 'assistant':
-                    prompt += f"Assistente: {msg['content']}\n"
-            
-            response = model.generate_content(prompt)
-            return response.text
-            
-        except ImportError:
-            raise Exception("Gemini SDK not installed")
+            return self._get_fallback_response(user_message, profile)
 
     def _get_fallback_response(self, user_message: str, skin_analysis: Optional[Dict]) -> str:
         """Generate fallback response when AI API is unavailable"""

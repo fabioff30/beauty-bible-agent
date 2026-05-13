@@ -183,32 +183,38 @@ class ProductDatabase:
         skin_type: str = None,
         concerns: List[str] = None,
         category: str = None,
+        subcategory: str = None,
         limit: int = 5
     ) -> List[Dict]:
         """
         Get product recommendations based on skin analysis
-        
+
         Args:
             skin_tone: Fitzpatrick skin tone name
             skin_type: Skin type (oleosa, seca, mista, normal, sensível)
             concerns: List of skin concerns
             category: Product category filter
+            subcategory: Product subcategory filter (limpeza, serum, hidratante, etc.)
             limit: Max number of recommendations
-            
+
         Returns:
             List of recommended products with match scores
         """
         scored_products = []
-        
+
         for product in self.products:
+            # Hard filter by subcategory when provided — routine slots need a specific product type
+            if subcategory and product.get('subcategory', '').lower() != subcategory.lower():
+                continue
+
             score = 0
             match_reasons = []
-            
+
             # Match skin type (weight: 3)
             if skin_type and skin_type.lower() in [t.lower() for t in product.get('skin_types', [])]:
                 score += 3
                 match_reasons.append(f"Ideal para pele {skin_type}")
-            
+
             # Match concerns (weight: 2 per concern)
             if concerns:
                 product_concerns = [c.lower() for c in product.get('concerns', [])]
@@ -216,18 +222,19 @@ class ProductDatabase:
                 score += len(matched_concerns) * 2
                 if matched_concerns:
                     match_reasons.append(f"Trata: {', '.join(matched_concerns)}")
-            
+
             # Match category (weight: 1)
             if category and category.lower() == product.get('category', '').lower():
                 score += 1
-            
-            if score > 0:
+
+            # When filtering by subcategory, include even zero-score matches so the routine slot always fills
+            if score > 0 or subcategory:
                 scored_products.append({
                     **product,
                     'match_score': score,
                     'match_reasons': match_reasons
                 })
-        
+
         # Sort by score and return top N
         scored_products.sort(key=lambda x: x['match_score'], reverse=True)
         return scored_products[:limit]
@@ -264,35 +271,27 @@ class ProductDatabase:
             'total_price': 0
         }
         
-        morning_categories = ['limpeza', 'hidratante', 'serum']
-        night_categories = ['limpeza', 'creme_noturno', 'olhos']
-        weekly_categories = ['mascara', 'esfoliante']
-        
-        for subcat in morning_categories:
-            recs = self.get_recommendations(
-                skin_type=skin_type,
-                limit=1
-            )
-            if recs:
-                routine['morning'].append(recs[0])
-                routine['total_price'] += recs[0]['price']
-        
-        for subcat in night_categories:
-            recs = self.get_recommendations(
-                skin_type=skin_type,
-                limit=1
-            )
-            if recs:
-                routine['night'].append(recs[0])
-                routine['total_price'] += recs[0]['price']
-        
-        for subcat in weekly_categories:
-            recs = self.get_recommendations(
-                skin_type=skin_type,
-                limit=1
-            )
-            if recs:
-                routine['weekly'].append(recs[0])
-                routine['total_price'] += recs[0]['price']
-        
+        slots = [
+            ('morning', ['limpeza', 'hidratante', 'serum']),
+            ('night', ['limpeza', 'creme_noturno', 'olhos']),
+            ('weekly', ['mascara', 'esfoliante']),
+        ]
+
+        priced_ids = set()
+        for slot_name, subcategories in slots:
+            for subcat in subcategories:
+                recs = self.get_recommendations(
+                    skin_type=skin_type,
+                    subcategory=subcat,
+                    limit=1,
+                )
+                if not recs:
+                    continue
+                product = recs[0]
+                routine[slot_name].append(product)
+                # Same cleanser used AM and PM — count its price only once
+                if product['id'] not in priced_ids:
+                    priced_ids.add(product['id'])
+                    routine['total_price'] += product['price']
+
         return routine

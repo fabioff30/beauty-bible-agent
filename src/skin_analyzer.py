@@ -96,9 +96,9 @@ class SkinAnalyzer:
         except Exception as e:
             logger.warning(f"OpenAI analysis failed: {e}")
             
-        # Ultimate fallback: basic color analysis
+        # Ultimate fallback: basic color analysis (sync — no I/O)
         logger.info("Using basic color analysis as fallback")
-        return await self._analyze_with_basic(image_path)
+        return self._analyze_with_basic(image_path)
 
     async def _analyze_with_gemini(self, image_path: Path) -> Optional[dict]:
         """Analyze using Google Gemini Vision"""
