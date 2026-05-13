@@ -1,21 +1,30 @@
 """
-Storage layer — async API over SQLCipher (sync driver wrapped via asyncio.to_thread).
+Storage layer — async API over SQLCipher.
 
-aiosqlite does not support SQLCipher natively, and the bot's traffic is low enough
-that a single connection guarded by an asyncio.Lock outperforms pool complexity.
+SQLite connections are bound to the thread that created them. asyncio.to_thread
+uses the default multi-threaded pool, so a connection opened on one thread
+gets handed to another and explodes with "SQLite objects created in a thread
+can only be used in that same thread".
+
+Fix: pin all DB work to a single-thread executor. The connection is created
+once (on the executor thread, on first use) and only ever used from that same
+thread. Operations are naturally serialized by the executor queue, so no
+asyncio.Lock is needed.
 """
 
 import asyncio
 import json
 import logging
-from typing import Any, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 from .connection import connect
 
 logger = logging.getLogger(__name__)
 
+_db_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='sqlite-db')
+
 _conn = None
-_write_lock = asyncio.Lock()
 
 
 def _get_conn():
@@ -30,8 +39,13 @@ def _row_to_dict(cursor, row):
     return {col[0]: row[i] for i, col in enumerate(cursor.description)}
 
 
+async def _run_db(func, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_db_executor, func, *args)
+
+
 # ---------------------------------------------------------------
-# Low-level helpers
+# Low-level helpers (sync — run inside the DB executor thread)
 # ---------------------------------------------------------------
 def _exec_sync(sql: str, params: tuple = ()) -> int:
     conn = _get_conn()
@@ -53,16 +67,15 @@ def _fetchall_sync(sql: str, params: tuple = ()) -> list[dict]:
 
 
 async def _exec(sql: str, params: tuple = ()) -> int:
-    async with _write_lock:
-        return await asyncio.to_thread(_exec_sync, sql, params)
+    return await _run_db(_exec_sync, sql, params)
 
 
 async def _fetchone(sql: str, params: tuple = ()) -> Optional[dict]:
-    return await asyncio.to_thread(_fetchone_sync, sql, params)
+    return await _run_db(_fetchone_sync, sql, params)
 
 
 async def _fetchall(sql: str, params: tuple = ()) -> list[dict]:
-    return await asyncio.to_thread(_fetchall_sync, sql, params)
+    return await _run_db(_fetchall_sync, sql, params)
 
 
 # ---------------------------------------------------------------
@@ -360,8 +373,7 @@ async def expire_low_value_episodes() -> int:
     Delete expired low-importance episodes. Returns count.
     Episodes with expires_at set and < now() AND importance < 0.4 are removed.
     """
-    async with _write_lock:
-        return await asyncio.to_thread(_expire_episodes_sync)
+    return await _run_db(_expire_episodes_sync)
 
 
 def _expire_episodes_sync() -> int:
@@ -386,8 +398,7 @@ async def delete_user_data(user_id: int) -> dict[str, int]:
     Hard delete every row owned by this user (cascades + explicit per safety).
     Returns counts so we can show the user what was removed.
     """
-    async with _write_lock:
-        return await asyncio.to_thread(_delete_user_data_sync, user_id)
+    return await _run_db(_delete_user_data_sync, user_id)
 
 
 def _delete_user_data_sync(user_id: int) -> dict[str, int]:
