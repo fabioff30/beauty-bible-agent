@@ -3,11 +3,11 @@ Beauty Bible Agent - Main Entry Point
 Bot Telegram da BB (consultora pessoal de beleza) com memória persistente em SQLCipher.
 """
 
-import os
+import asyncio
 import logging
-from pathlib import Path
-
+import os
 from html import escape as html_escape
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -15,6 +15,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from src.skin_analyzer import SkinAnalyzer
 from src.product_db import ProductDatabase
 from src.agent import BeautyAdvisorAgent
+from src.chat_pacing import keep_typing, send_chunked, split_response
 from src.db import storage
 from src.db.connection import init_db
 from src.dreaming.scheduler import start_scheduler, stop_scheduler
@@ -44,6 +45,9 @@ class BeautyBibleBot:
             product_db=self.product_db,
             skin_analyzer=self.skin_analyzer,
         )
+        # Per-user in-flight response task — lets a new message cancel the
+        # pending reply instead of letting both run and arrive out of order.
+        self._response_tasks: dict[int, asyncio.Task] = {}
 
     # -----------------------------------------------------------
     # Commands
@@ -186,7 +190,7 @@ Como posso te ajudar hoje?
                     logger.warning(f"Could not delete {photo_path}: {e}")
 
     # -----------------------------------------------------------
-    # Text handler
+    # Text handler — chunked reply with typing simulation
     # -----------------------------------------------------------
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
@@ -198,12 +202,71 @@ Como posso te ajudar hoje?
 
         await storage.append_message(user.id, 'user', redacted)
 
-        response = await self.agent.get_response(user_message=redacted, user_id=user.id)
+        # If a previous reply is still streaming chunks, cancel it so the new
+        # message doesn't get its response interleaved with the old one.
+        prev = self._response_tasks.get(user.id)
+        if prev and not prev.done():
+            prev.cancel()
+            try:
+                await prev
+            except (asyncio.CancelledError, Exception):
+                pass
 
-        await storage.append_message(user.id, 'assistant', response)
-        # No parse_mode: LLM responses are free-form and may contain unbalanced
-        # markdown that would crash the send. Plain text is safer.
-        await update.message.reply_text(response)
+        # Fire-and-forget: handler returns quickly, response streams in background.
+        task = asyncio.create_task(
+            self._generate_and_send(user.id, update.effective_chat.id, redacted, context),
+        )
+        self._response_tasks[user.id] = task
+
+    async def _generate_and_send(
+        self,
+        user_id: int,
+        chat_id: int,
+        user_message: str,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        """Run LLM generation with a typing pulse, then send the reply in chunks."""
+        stop = asyncio.Event()
+        typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop))
+        try:
+            response = await self.agent.get_response(
+                user_message=user_message, user_id=user_id,
+            )
+        except asyncio.CancelledError:
+            logger.info(f"Response generation cancelled for user {user_id}")
+            raise
+        except Exception as e:
+            logger.exception(f"LLM call failed for user {user_id}: {e}")
+            stop.set()
+            await typing_task
+            try:
+                await context.bot.send_message(
+                    chat_id, "Ops, deu ruim aqui do meu lado. Tenta de novo? 💛",
+                )
+            except Exception:
+                pass
+            return
+        finally:
+            stop.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        # Persist the assistant turn before sending so a crash mid-send doesn't
+        # leave the user's message dangling in history without a reply on file.
+        try:
+            await storage.append_message(user_id, 'assistant', response)
+        except Exception:
+            logger.exception(f"Failed to persist assistant message for user {user_id}")
+
+        try:
+            await send_chunked(context.bot, chat_id, response)
+        except asyncio.CancelledError:
+            logger.info(f"Chunked send cancelled mid-stream for user {user_id}")
+            raise
+        except Exception as e:
+            logger.exception(f"send_chunked failed for user {user_id}: {e}")
 
     # -----------------------------------------------------------
     # Helpers
