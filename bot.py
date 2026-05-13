@@ -15,7 +15,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from src.skin_analyzer import SkinAnalyzer
 from src.product_db import ProductDatabase
 from src.agent import BeautyAdvisorAgent
-from src.chat_pacing import keep_typing, send_chunked, split_response
+from src.chat_pacing import keep_typing, send_chunked
 from src.db import storage
 from src.db.connection import init_db
 from src.dreaming.scheduler import start_scheduler, stop_scheduler
@@ -125,18 +125,20 @@ Como posso te ajudar hoje?
         logger.info(f"LGPD delete executed for user {user.id}: {counts}")
 
     # -----------------------------------------------------------
-    # Photo handler
+    # Photo handler — analyze, persist, then hand off to BB for warm reply
     # -----------------------------------------------------------
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        chat_id = update.effective_chat.id
         await storage.ensure_user(user.id, user.username, user.first_name)
         logger.info(f"Received photo from user {user.id}")
 
         processing_msg = await update.message.reply_text(
-            "📸 Analisando sua pele... só um instante..."
+            "📸 Tô olhando aqui com carinho..."
         )
 
         photo_path: Path | None = None
+        analyzed = False
         try:
             photo = update.message.photo[-1]  # highest res
             photo_file = await context.bot.get_file(photo.file_id)
@@ -147,12 +149,10 @@ Como posso te ajudar hoje?
             await photo_file.download_to_drive(photo_path)
 
             # Hash before analysis (stable even after deletion)
-            photo_bytes = photo_path.read_bytes()
-            phash = hash_photo(photo_bytes)
+            phash = hash_photo(photo_path.read_bytes())
 
             analysis = await self.skin_analyzer.analyze(photo_path)
 
-            # Persist: profile snapshot + episodic event
             await storage.upsert_profile(user.id, analysis, photo_hash=phash)
             await storage.append_episode(
                 user_id=user.id,
@@ -165,29 +165,91 @@ Como posso te ajudar hoje?
                 payload={**analysis, 'photo_hash': phash},
                 importance=0.9,
             )
-
-            recommendations = self.product_db.get_recommendations(
-                skin_tone=analysis.get('skin_tone'),
-                skin_type=analysis.get('skin_type'),
-                concerns=analysis.get('concerns', []),
-            )
-
-            result_text = self._format_analysis_result(analysis, recommendations)
-            await processing_msg.edit_text(result_text, parse_mode='HTML')
+            analyzed = True
 
         except Exception as e:
             logger.exception(f"Error analyzing photo: {e}")
-            await processing_msg.edit_text(
-                "❌ Desculpe, deu erro ao analisar sua foto. "
-                "Tenta de novo com mais luz?"
-            )
+            try:
+                await processing_msg.edit_text(
+                    "❌ Não consegui analisar essa foto. Tenta uma com mais luz natural? 💛"
+                )
+            except Exception:
+                pass
         finally:
-            # Always delete the raw photo — we only retain the structured analysis + hash
+            # Delete the raw photo regardless — only the structured analysis + hash remain.
             if photo_path and photo_path.exists():
                 try:
                     photo_path.unlink()
                 except OSError as e:
                     logger.warning(f"Could not delete {photo_path}: {e}")
+
+        if not analyzed:
+            return
+
+        # Hand off to BB for warm presentation. Delete the processing notice so
+        # the chunked bubbles arrive cleanly without the "tô olhando" line above.
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+
+        # Cancel any pending text-handler reply — photo trumps prior chatter.
+        prev = self._response_tasks.get(user.id)
+        if prev and not prev.done():
+            prev.cancel()
+            try:
+                await prev
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task = asyncio.create_task(self._present_analysis_flow(user.id, chat_id, context))
+        self._response_tasks[user.id] = task
+
+    async def _present_analysis_flow(
+        self,
+        user_id: int,
+        chat_id: int,
+        context: ContextTypes.DEFAULT_TYPE,
+    ):
+        """LLM-driven warm presentation of the just-saved skin profile."""
+        stop = asyncio.Event()
+        typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop))
+        try:
+            response = await self.agent.present_analysis(user_id)
+        except asyncio.CancelledError:
+            logger.info(f"Analysis presentation cancelled for user {user_id}")
+            raise
+        except Exception as e:
+            logger.exception(f"present_analysis failed for {user_id}: {e}")
+            stop.set()
+            await typing_task
+            try:
+                await context.bot.send_message(
+                    chat_id,
+                    "Consegui ver sua análise, mas travei aqui pra te contar. Tenta de novo? 💛",
+                )
+            except Exception:
+                pass
+            return
+        finally:
+            stop.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+        try:
+            await storage.append_message(user_id, 'assistant', response)
+        except Exception:
+            logger.exception(f"Failed to persist analysis presentation for {user_id}")
+
+        try:
+            await send_chunked(context.bot, chat_id, response)
+        except asyncio.CancelledError:
+            logger.info(f"Analysis presentation chunks cancelled for user {user_id}")
+            raise
+        except Exception as e:
+            logger.exception(f"send_chunked (analysis) failed for {user_id}: {e}")
 
     # -----------------------------------------------------------
     # Text handler — chunked reply with typing simulation
@@ -267,31 +329,6 @@ Como posso te ajudar hoje?
             raise
         except Exception as e:
             logger.exception(f"send_chunked failed for user {user_id}: {e}")
-
-    # -----------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------
-    def _format_analysis_result(self, analysis: dict, recommendations: list) -> str:
-        e = html_escape
-        text = "✨ <b>Análise da Sua Pele</b> ✨\n\n"
-        text += f"🎨 <b>Tom de Pele:</b> {e(str(analysis.get('skin_tone', 'N/D')))}\n"
-        text += f"💧 <b>Tipo de Pele:</b> {e(str(analysis.get('skin_type', 'N/D')))}\n"
-        if analysis.get('undertone'):
-            text += f"🔸 <b>Subtom:</b> {e(str(analysis.get('undertone')))}\n"
-        if analysis.get('concerns'):
-            text += "\n<b>Concerns identificados:</b>\n"
-            for concern in analysis.get('concerns', []):
-                text += f"  • {e(str(concern))}\n"
-
-        text += "\n" + "=" * 30 + "\n"
-        text += "💡 <b>Produtos Recomendados:</b>\n\n"
-        for i, rec in enumerate(recommendations[:5], 1):
-            text += f"{i}. <b>{e(rec['name'])}</b>\n"
-            text += f"   💰 R$ {rec['price']}\n"
-            text += f"   📝 {e(rec['description'][:80])}...\n\n"
-        text += "\n💬 Quer mais detalhes sobre algum produto?"
-        return text
-
 
 async def _post_init(application):
     # Scheduler must start inside the asyncio loop that run_polling creates.

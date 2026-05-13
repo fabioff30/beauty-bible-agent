@@ -145,6 +145,44 @@ Use estes dados para personalizar suas recomendações."""
         prompt += f"\nData atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         return prompt
 
+    async def present_analysis(self, user_id: int) -> str:
+        """
+        Read the just-persisted skin profile and produce a warm presentation
+        of the analysis, ending with an open question about what the user
+        wants to focus on. Uses the same persona/chunking rules as get_response.
+        """
+        profile = await storage.get_profile(user_id)
+        facts = await storage.list_facts(user_id)
+        summary_row = await storage.get_summary(user_id, scope='rolling')
+
+        system_prompt = self._get_system_prompt(
+            skin_analysis=profile,
+            rolling_summary=summary_row['summary'] if summary_row else None,
+            facts=facts,
+        )
+
+        directive = (
+            "A cliente acabou de me mandar uma foto e a análise dela está nos "
+            "DADOS DA ANÁLISE DE PELE acima.\n\n"
+            "Sua tarefa AGORA, nesta mensagem:\n"
+            "1) Comente a análise dela de forma calorosa e acolhedora, em 2 ou 3 "
+            "bolhas curtas. Destaque tom, tipo e 1-2 concerns principais sem "
+            "soar relatório técnico. Use a primeira pessoa ('vi que', 'percebi').\n"
+            "2) NÃO recomende produto específico ainda.\n"
+            "3) Termine com UMA pergunta aberta convidando ela a escolher o caminho: "
+            "exemplos — recomendação de produtos da nossa linha, montar uma rotina "
+            "de skincare, tirar dúvida de algum cuidado, ou conversar sobre algo "
+            "específico que ela queira melhorar.\n\n"
+            "Lembre: 1-4 bolhas, separadas por <split>, sem markdown, no máximo "
+            "1 emoji por bolha. Você é parceira da rotina dela, não vitrine."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": directive},
+        ]
+        return await chat_completion(messages, model=self.model)
+
     async def get_response(self, user_message: str, user_id: int) -> str:
         """
         Generate AI response, reading context from the persistent store.
