@@ -60,7 +60,7 @@ async def extract_facts(new_messages: list[dict]) -> list[dict]:
         {"role": "user", "content": build_extract_user_prompt(new_messages)},
     ]
 
-    raw = await chat_completion(
+    raw, _ = await chat_completion(
         messages,
         model=_dream_model(),
         temperature=0.2,
@@ -89,7 +89,7 @@ async def update_summary(previous_summary: Optional[str], new_messages: list[dic
         {"role": "user", "content": build_summary_user_prompt(previous_summary, new_messages)},
     ]
 
-    raw = await chat_completion(
+    raw, _ = await chat_completion(
         messages,
         model=_dream_model(),
         temperature=0.3,

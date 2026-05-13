@@ -1,6 +1,7 @@
 """
 Skin Analyzer - AI-powered skin analysis module
 Reconhece tom de pele, tipo, subtom e concerns usando visão computacional
+via Google Gemini SDK. Sem grounding (vision não precisa de busca web).
 """
 
 import os
@@ -10,7 +11,17 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from google import genai
+from google.genai import types
+
 logger = logging.getLogger(__name__)
+
+
+def _normalize_model(model: str) -> str:
+    """Strip OpenRouter-style provider prefix ('google/gemini-x' -> 'gemini-x')."""
+    if '/' in model:
+        return model.split('/', 1)[1]
+    return model
 
 
 class SkinAnalyzer:
@@ -63,79 +74,51 @@ class SkinAnalyzer:
     def __init__(self, api_key: Optional[str] = None):
         """
         Initialize skin analyzer
-        
+
         Args:
-            api_key: OpenAI or OpenRouter API key
+            api_key: Gemini API key (defaults to GEMINI_API_KEY env)
         """
-        self.api_key = api_key or os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
-        self.model = os.getenv('VISION_MODEL', 'google/gemini-2.5-flash')
+        self.api_key = api_key or os.getenv('GEMINI_API_KEY', '')
+        self.model = _normalize_model(os.getenv('VISION_MODEL', 'gemini-2.5-flash'))
 
     async def analyze(self, image_path: Path) -> dict:
         """
-        Analyze a photo to determine skin characteristics.
-        Goes through OpenRouter (or OpenAI directly if AI_PROVIDER=openai).
-        Falls back to a local color-based heuristic only if the API call fails.
+        Analyze a photo to determine skin characteristics via Gemini.
+        Falls back to a local color-based heuristic if the API call fails.
         """
         try:
-            return await self._analyze_with_vision_api(image_path)
+            return await self._analyze_with_gemini(image_path)
         except Exception as e:
-            logger.warning(f"Vision API analysis failed: {e}")
+            logger.warning(f"Gemini vision analysis failed: {e}")
 
         logger.info("Using basic color analysis as fallback")
         return self._analyze_with_basic(image_path)
 
-    async def _analyze_with_vision_api(self, image_path: Path) -> dict:
-        """Analyze using OpenRouter (default) or OpenAI Vision endpoints."""
-        import httpx
+    async def _analyze_with_gemini(self, image_path: Path) -> dict:
+        """Analyze using the Gemini API directly (vision-capable model)."""
+        if not self.api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY not set. Get one at https://aistudio.google.com/apikey"
+            )
 
-        with open(image_path, 'rb') as f:
-            image_data = base64.b64encode(f.read()).decode('utf-8')
+        image_bytes = image_path.read_bytes()
+        client = genai.Client(api_key=self.api_key)
 
-        provider = os.getenv('AI_PROVIDER', 'openrouter')
-        if provider == 'openai':
-            api_url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
-                "Content-Type": "application/json",
-            }
-        else:
-            # Default: OpenRouter. Gemini models like google/gemini-3.1-flash-lite
-            # are routed through OpenRouter — no separate Google SDK needed.
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY', '')}",
-                "HTTP-Referer": "https://beautybible.app",
-                "X-Title": "Beauty Bible",
-                "Content-Type": "application/json",
-            }
+        config = types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=500,
+            response_mime_type='application/json',
+        )
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
-                        },
-                        {
-                            "type": "text",
-                            "text": self._get_analysis_prompt(),
-                        },
-                    ],
-                }
+        response = await client.aio.models.generate_content(
+            model=self.model,
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type='image/jpeg'),
+                self._get_analysis_prompt(),
             ],
-            "max_tokens": 500,
-            "temperature": 0.3,
-        }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(api_url, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            content = data['choices'][0]['message']['content']
-            return self._parse_response(content)
+            config=config,
+        )
+        return self._parse_response(response.text or '')
 
     def _analyze_with_basic(self, image_path: Path) -> dict:
         """Basic color-based analysis (no AI)"""

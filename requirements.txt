@@ -3,11 +3,12 @@
 # Telegram Bot Framework
 python-telegram-bot>=20.0
 
-# Async HTTP client
-httpx>=0.25.0
-
 # Environment variables
 python-dotenv>=1.0.0
+
+# Google GenAI SDK (Gemini) — substituto do deprecated `google-generativeai`.
+# Usado pra conversa, vision e dream job. Suporta Google Search grounding.
+google-genai>=1.0.0
 
 # Image processing (for basic skin analysis fallback)
 Pillow>=10.0.0

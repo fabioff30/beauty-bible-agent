@@ -20,10 +20,13 @@ import asyncio
 import logging
 import random
 import re
+from html import escape as html_escape
 
 from telegram.constants import ChatAction
 
 logger = logging.getLogger(__name__)
+
+MAX_SOURCES_DISPLAYED = 4
 
 SPLIT_TAG = "<split>"
 MAX_CHUNKS = 5
@@ -120,9 +123,34 @@ async def keep_typing(bot, chat_id: int, stop_event: asyncio.Event) -> None:
             continue
 
 
-async def send_chunked(bot, chat_id: int, text: str) -> list[str]:
+def _format_sources_bubble(sources: list[dict]) -> str:
+    """HTML 'Onde achei' bubble — dedupe titles, escape, cap at MAX_SOURCES_DISPLAYED."""
+    seen_titles: set[str] = set()
+    parts: list[str] = []
+    for s in sources:
+        uri = (s.get('uri') or '').strip()
+        title = (s.get('title') or uri).strip()
+        if not uri or title in seen_titles:
+            continue
+        seen_titles.add(title)
+        # Telegram HTML supports <a href>; escape both
+        parts.append(f'<a href="{html_escape(uri, quote=True)}">{html_escape(title)}</a>')
+        if len(parts) >= MAX_SOURCES_DISPLAYED:
+            break
+    if not parts:
+        return ''
+    return "📚 Onde achei: " + ", ".join(parts)
+
+
+async def send_chunked(
+    bot,
+    chat_id: int,
+    text: str,
+    sources: list[dict] | None = None,
+) -> list[str]:
     """
     Send the response as separate bubbles with typing pulses and pacing.
+    If `sources` is non-empty, appends one final HTML bubble listing them.
     Returns the chunks actually sent (useful for persistence).
     """
     chunks = split_response(text)
@@ -136,4 +164,24 @@ async def send_chunked(bot, chat_id: int, text: str) -> list[str]:
             await asyncio.sleep(delay_for(chunk))
         await bot.send_message(chat_id=chat_id, text=chunk)
         sent.append(chunk)
+
+    if sources:
+        bubble = _format_sources_bubble(sources)
+        if bubble:
+            try:
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=bubble,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True,
+                )
+                sent.append(bubble)
+            except Exception as e:
+                logger.warning(f"Failed to send sources bubble: {e}")
+
     return sent

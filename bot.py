@@ -215,7 +215,7 @@ Como posso te ajudar hoje?
         stop = asyncio.Event()
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop))
         try:
-            response = await self.agent.present_analysis(user_id)
+            response, sources = await self.agent.present_analysis(user_id)
         except asyncio.CancelledError:
             logger.info(f"Analysis presentation cancelled for user {user_id}")
             raise
@@ -244,7 +244,7 @@ Como posso te ajudar hoje?
             logger.exception(f"Failed to persist analysis presentation for {user_id}")
 
         try:
-            await send_chunked(context.bot, chat_id, response)
+            await send_chunked(context.bot, chat_id, response, sources=sources)
         except asyncio.CancelledError:
             logger.info(f"Analysis presentation chunks cancelled for user {user_id}")
             raise
@@ -291,7 +291,7 @@ Como posso te ajudar hoje?
         stop = asyncio.Event()
         typing_task = asyncio.create_task(keep_typing(context.bot, chat_id, stop))
         try:
-            response = await self.agent.get_response(
+            response, sources = await self.agent.get_response(
                 user_message=user_message, user_id=user_id,
             )
         except asyncio.CancelledError:
@@ -323,7 +323,7 @@ Como posso te ajudar hoje?
             logger.exception(f"Failed to persist assistant message for user {user_id}")
 
         try:
-            await send_chunked(context.bot, chat_id, response)
+            await send_chunked(context.bot, chat_id, response, sources=sources)
         except asyncio.CancelledError:
             logger.info(f"Chunked send cancelled mid-stream for user {user_id}")
             raise

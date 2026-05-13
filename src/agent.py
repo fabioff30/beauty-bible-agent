@@ -8,11 +8,11 @@ Internal codename: beauty_bible.
 import json
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 from src.db import storage
-from src.llm import chat_completion
+from src.llm import chat_completion, Sources
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +31,9 @@ class BeautyAdvisorAgent:
         self.product_db = product_db
         self.skin_analyzer = skin_analyzer
 
-        # AI model configuration
-        self.provider = os.getenv('AI_PROVIDER', 'openrouter')  # openrouter, openai, gemini
-        self.model = os.getenv('AI_MODEL', 'google/gemini-2.5-flash')
+        # AI model — Gemini SDK takes the model id without provider prefix.
+        # _normalize_model() in llm.py also strips 'google/' if env still has it.
+        self.model = os.getenv('AI_MODEL', 'gemini-2.5-flash')
 
         # System prompt for BB. Updated to enforce:
         # (a) short, chunked replies separated by <split>
@@ -145,11 +145,12 @@ Use estes dados para personalizar suas recomendações."""
         prompt += f"\nData atual: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
         return prompt
 
-    async def present_analysis(self, user_id: int) -> str:
+    async def present_analysis(self, user_id: int) -> Tuple[str, Sources]:
         """
         Read the just-persisted skin profile and produce a warm presentation
         of the analysis, ending with an open question about what the user
         wants to focus on. Uses the same persona/chunking rules as get_response.
+        Returns (text, sources).
         """
         profile = await storage.get_profile(user_id)
         facts = await storage.list_facts(user_id)
@@ -181,9 +182,10 @@ Use estes dados para personalizar suas recomendações."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": directive},
         ]
-        return await chat_completion(messages, model=self.model)
+        # Grounding ON: analysis comments may reference real cosmetology context.
+        return await chat_completion(messages, model=self.model, with_search=True)
 
-    async def get_response(self, user_message: str, user_id: int) -> str:
+    async def get_response(self, user_message: str, user_id: int) -> Tuple[str, Sources]:
         """
         Generate AI response, reading context from the persistent store.
 
@@ -212,10 +214,11 @@ Use estes dados para personalizar suas recomendações."""
         messages.append({"role": "user", "content": user_message})
 
         try:
-            return await chat_completion(messages, model=self.model)
+            # Grounding ON: BB can cite real sources for "onde comprar", etc.
+            return await chat_completion(messages, model=self.model, with_search=True)
         except Exception as e:
             logger.error(f"AI API error: {e}")
-            return self._get_fallback_response(user_message, profile)
+            return self._get_fallback_response(user_message, profile), []
 
     def _get_fallback_response(self, user_message: str, skin_analysis: Optional[Dict]) -> str:
         """Generate fallback response when AI API is unavailable"""
