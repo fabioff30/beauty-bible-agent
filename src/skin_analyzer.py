@@ -67,85 +67,48 @@ class SkinAnalyzer:
         Args:
             api_key: OpenAI or OpenRouter API key
         """
-        self.api_key = api_key or os.getenv('OPENAI_API_KEY') or os.getenv('OPENROUTER_API_KEY')
-        self.model = os.getenv('VISION_MODEL', 'openai/gpt-4o')
+        self.api_key = api_key or os.getenv('OPENROUTER_API_KEY') or os.getenv('OPENAI_API_KEY')
+        self.model = os.getenv('VISION_MODEL', 'google/gemini-2.5-flash')
 
     async def analyze(self, image_path: Path) -> dict:
         """
-        Analyze a photo to determine skin characteristics
-        
-        Args:
-            image_path: Path to user's photo
-            
-        Returns:
-            dict with skin analysis results
+        Analyze a photo to determine skin characteristics.
+        Goes through OpenRouter (or OpenAI directly if AI_PROVIDER=openai).
+        Falls back to a local color-based heuristic only if the API call fails.
         """
-        # Try Google Gemini first (free, good for vision)
         try:
-            result = await self._analyze_with_gemini(image_path)
-            if result:
-                return result
-        except ImportError:
-            logger.info("Gemini not available, trying OpenAI/OpenRouter...")
+            return await self._analyze_with_vision_api(image_path)
         except Exception as e:
-            logger.warning(f"Gemini analysis failed: {e}")
+            logger.warning(f"Vision API analysis failed: {e}")
 
-        # Fallback to OpenAI/OpenRouter
-        try:
-            return await self._analyze_with_openai(image_path)
-        except Exception as e:
-            logger.warning(f"OpenAI analysis failed: {e}")
-            
-        # Ultimate fallback: basic color analysis (sync — no I/O)
         logger.info("Using basic color analysis as fallback")
         return self._analyze_with_basic(image_path)
 
-    async def _analyze_with_gemini(self, image_path: Path) -> Optional[dict]:
-        """Analyze using Google Gemini Vision"""
-        try:
-            import google.generativeai as genai
-            
-            genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-            model = genai.GenerativeModel('gemini-2.0-flash')
-            
-            # Upload the image
-            import PIL.Image
-            img = PIL.Image.open(image_path)
-            
-            prompt = self._get_analysis_prompt()
-            
-            response = model.generate_content([prompt, img])
-            return self._parse_response(response.text)
-        except Exception as e:
-            logger.warning(f"Gemini error: {e}")
-            return None
-
-    async def _analyze_with_openai(self, image_path: Path) -> dict:
-        """Analyze using OpenAI/OpenRouter Vision API"""
+    async def _analyze_with_vision_api(self, image_path: Path) -> dict:
+        """Analyze using OpenRouter (default) or OpenAI Vision endpoints."""
         import httpx
-        
-        # Convert image to base64
+
         with open(image_path, 'rb') as f:
             image_data = base64.b64encode(f.read()).decode('utf-8')
-        
-        # Determine API endpoint
-        if os.getenv('OPENROUTER_API_KEY'):
-            api_url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-                "HTTP-Referer": "https://beautybible.app",
-                "X-Title": "Beauty Bible",
-                "Content-Type": "application/json"
-            }
-        else:
+
+        provider = os.getenv('AI_PROVIDER', 'openrouter')
+        if provider == 'openai':
             api_url = "https://api.openai.com/v1/chat/completions"
             headers = {
-                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
+                "Content-Type": "application/json",
             }
-        
-        prompt = self._get_analysis_prompt()
-        
+        else:
+            # Default: OpenRouter. Gemini models like google/gemini-3.1-flash-lite
+            # are routed through OpenRouter — no separate Google SDK needed.
+            api_url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY', '')}",
+                "HTTP-Referer": "https://beautybible.app",
+                "X-Title": "Beauty Bible",
+                "Content-Type": "application/json",
+            }
+
         payload = {
             "model": self.model,
             "messages": [
@@ -154,24 +117,23 @@ class SkinAnalyzer:
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_data}"},
                         },
                         {
                             "type": "text",
-                            "text": prompt
-                        }
-                    ]
+                            "text": self._get_analysis_prompt(),
+                        },
+                    ],
                 }
             ],
             "max_tokens": 500,
-            "temperature": 0.3
+            "temperature": 0.3,
         }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(api_url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
-            
             content = data['choices'][0]['message']['content']
             return self._parse_response(content)
 
